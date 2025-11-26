@@ -1,0 +1,588 @@
+<?php
+/**
+ * Plugin Name: Review View Logger
+ * Description: レビュー投稿の閲覧ログを記録し、IP・リファラ・閲覧回数・メモなどをダッシュボードから確認できます。
+ * Author: You
+ * Version: 1.2
+ */
+
+if ( ! defined( 'ABSPATH' ) ) {
+    exit;
+}
+
+class Review_View_Logger {
+
+    public function __construct() {
+        register_activation_hook( __FILE__, array( $this, 'activate' ) );
+        add_action( 'template_redirect', array( $this, 'log_review_view' ) );
+        add_action( 'admin_menu', array( $this, 'add_admin_menu' ) );
+    }
+
+    /**
+     * 有効化時：ビュー用テーブル作成（memo カラム付き）
+     */
+    public function activate() {
+        global $wpdb;
+
+        $table_name      = $wpdb->base_prefix . 'view_logs';
+        $charset_collate = $wpdb->get_charset_collate();
+
+        $sql = "CREATE TABLE IF NOT EXISTS {$table_name} (
+            id BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+            blog_id BIGINT(20) UNSIGNED NOT NULL,
+            post_id BIGINT(20) UNSIGNED NOT NULL,
+            ip_address VARCHAR(100) NOT NULL,
+            user_agent TEXT NULL,
+            referrer TEXT NULL,
+            visit_number INT(11) NOT NULL DEFAULT 1,
+            memo TEXT NULL,
+            created_at DATETIME NOT NULL,
+            PRIMARY KEY  (id),
+            KEY post_ip (post_id, ip_address),
+            KEY blog_id (blog_id)
+        ) {$charset_collate};";
+
+        require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+        dbDelta( $sql );
+    }
+
+    /**
+     * レビュー投稿が表示されたときにロギング
+     */
+    public function log_review_view() {
+        if ( ! is_singular( 'review' ) ) {
+            return;
+        }
+
+        $post_id = get_queried_object_id();
+        if ( ! $post_id ) {
+            return;
+        }
+
+        $this->insert_view_log( $post_id );
+    }
+
+    /**
+     * ログ挿入処理
+     */
+    private function insert_view_log( $post_id ) {
+        global $wpdb;
+
+        $table_name = $wpdb->base_prefix . 'view_logs';
+        $blog_id    = get_current_blog_id();
+
+        $ip_address = $this->get_ip_address();
+        $user_agent = isset( $_SERVER['HTTP_USER_AGENT'] ) ? sanitize_text_field( wp_unslash( $_SERVER['HTTP_USER_AGENT'] ) ) : '';
+
+        $referrer = '';
+        if ( ! empty( $_SERVER['HTTP_REFERER'] ) ) {
+            $referrer = esc_url_raw( wp_unslash( $_SERVER['HTTP_REFERER'] ) );
+        }
+
+        // 同じIP + 同じpost_id で何回目の閲覧か
+        $visit_number = 1;
+        if ( $ip_address ) {
+            $count = $wpdb->get_var(
+                $wpdb->prepare(
+                    "SELECT COUNT(*) FROM {$table_name} WHERE post_id = %d AND ip_address = %s",
+                    $post_id,
+                    $ip_address
+                )
+            );
+            if ( $count !== null ) {
+                $visit_number = intval( $count ) + 1;
+            }
+        }
+
+        $wpdb->insert(
+            $table_name,
+            array(
+                'blog_id'      => $blog_id,
+                'post_id'      => $post_id,
+                'ip_address'   => $ip_address,
+                'user_agent'   => $user_agent,
+                'referrer'     => $referrer,
+                'visit_number' => $visit_number,
+                'memo'         => null,
+                'created_at'   => current_time( 'mysql' ),
+            ),
+            array(
+                '%d',
+                '%d',
+                '%s',
+                '%s',
+                '%s',
+                '%d',
+                '%s',
+                '%s',
+            )
+        );
+    }
+
+    /**
+     * IPアドレス取得
+     */
+    private function get_ip_address() {
+        $ip = '';
+
+        if ( ! empty( $_SERVER['HTTP_X_FORWARDED_FOR'] ) ) {
+            $ips = explode( ',', wp_unslash( $_SERVER['HTTP_X_FORWARDED_FOR'] ) );
+            $ip  = trim( $ips[0] );
+        } elseif ( ! empty( $_SERVER['REMOTE_ADDR'] ) ) {
+            $ip = wp_unslash( $_SERVER['REMOTE_ADDR'] );
+        }
+
+        return sanitize_text_field( $ip );
+    }
+
+    /**
+     * 管理画面メニュー追加
+     */
+    public function add_admin_menu() {
+        add_menu_page(
+            '閲覧ログ',
+            '閲覧ログ',
+            'manage_options',
+            'review-view-logs',
+            array( $this, 'render_admin_page' ),
+            'dashicons-visibility',
+            81
+        );
+    }
+
+    /**
+     * 管理画面：閲覧ログ一覧 + メモ編集 + 一括削除 + ソート + CSV エクスポート
+     */
+    public function render_admin_page() {
+        if ( ! current_user_can( 'manage_options' ) ) {
+            wp_die( esc_html__( 'You do not have permission to access this page.' ) );
+        }
+
+        global $wpdb;
+
+        $table_name = $wpdb->base_prefix . 'view_logs';
+        $blog_id    = get_current_blog_id();
+
+        // ▼ CSV エクスポート（全件）
+        if ( isset( $_GET['rvl_export'], $_GET['_wpnonce'] ) && check_admin_referer( 'rvl_export', '_wpnonce' ) ) {
+            $this->export_csv( $table_name, $blog_id );
+            // ここで終了
+        }
+        // ▼ 全件削除処理
+if ( isset( $_GET['rvl_delete_all'], $_GET['_wpnonce'] ) 
+     && check_admin_referer( 'rvl_delete_all_action' ) ) {
+
+    $wpdb->query(
+        $wpdb->prepare(
+            "DELETE FROM {$table_name} WHERE blog_id = %d",
+            $blog_id
+        )
+    );
+
+    echo '<div class="updated"><p>すべての閲覧ログを削除しました。</p></div>';
+}
+
+
+        // ▼ 一括削除処理
+        if ( isset( $_POST['rvl_bulk_delete'], $_POST['log_ids'], $_POST['_wpnonce'] ) ) {
+            check_admin_referer( 'rvl_bulk_delete', '_wpnonce' );
+            $ids = array_map( 'intval', (array) $_POST['log_ids'] );
+            $ids = array_filter( $ids );
+            if ( ! empty( $ids ) ) {
+                $placeholders = implode( ',', array_fill( 0, count( $ids ), '%d' ) );
+                $sql          = $wpdb->prepare(
+                    "DELETE FROM {$table_name} WHERE blog_id = %d AND id IN ({$placeholders})",
+                    array_merge( array( $blog_id ), $ids )
+                );
+                $wpdb->query( $sql );
+                echo '<div class="updated"><p>選択したログを削除しました。（' . esc_html( count( $ids ) ) . '件）</p></div>';
+            }
+        }
+        // ▼ 選択した行だけCSVエクスポート
+if ( isset( $_POST['rvl_export_selected'], $_POST['log_ids'], $_POST['_wpnonce'] ) ) {
+    check_admin_referer( 'rvl_bulk_delete', '_wpnonce' );
+
+    $ids = array_map( 'intval', (array) $_POST['log_ids'] );
+    $ids = array_filter( $ids );
+    if ( ! empty( $ids ) ) {
+
+        header( 'Content-Type: text/csv; charset=utf-8' );
+        header( 'Content-Disposition: attachment; filename=selected-view-logs-' . date( 'Ymd_His' ) . '.csv' );
+
+        $output = fopen( 'php://output', 'w' );
+        fputcsv( $output, array( 'id', 'blog_id', 'post_id', 'ip_address', 'referrer', 'visit_number', 'memo', 'created_at' ) );
+
+        $placeholders = implode( ',', array_fill( 0, count( $ids ), '%d' ) );
+
+        $rows = $wpdb->get_results(
+            $wpdb->prepare(
+                "SELECT id, blog_id, post_id, ip_address, referrer, visit_number, memo, created_at
+                 FROM {$table_name}
+                 WHERE id IN ($placeholders)",
+                $ids
+            ),
+            ARRAY_A
+        );
+
+        foreach ( $rows as $r ) {
+            fputcsv( $output, $r );
+        }
+
+        fclose( $output );
+        exit;
+    }
+}
+
+
+        // ▼ メモ保存処理（1行ずつ）
+        if ( isset( $_POST['rvl_save_memo'], $_POST['log_id'], $_POST['_wpnonce'] ) ) {
+            $log_id = intval( $_POST['log_id'] );
+            if ( $log_id > 0 && check_admin_referer( 'rvl_save_memo_' . $log_id, '_wpnonce' ) ) {
+                $memo = isset( $_POST['memo'] ) ? wp_kses_post( wp_unslash( $_POST['memo'] ) ) : '';
+                $wpdb->update(
+                    $table_name,
+                    array( 'memo' => $memo ),
+                    array(
+                        'id'      => $log_id,
+                        'blog_id' => $blog_id,
+                    ),
+                    array( '%s' ),
+                    array( '%d', '%d' )
+                );
+                echo '<div class="updated"><p>メモを保存しました。（ID: ' . esc_html( $log_id ) . '）</p></div>';
+            }
+        }
+
+        // ▼ ソート条件
+        $allowed_orderby = array(
+            'id'         => 'id',
+            'date'       => 'created_at',
+            'ip'        => 'ip_address',
+            'visit'      => 'visit_number',
+        );
+
+        $orderby = isset( $_GET['orderby'] ) ? sanitize_key( $_GET['orderby'] ) : 'date';
+        $order   = isset( $_GET['order'] ) ? strtolower( sanitize_text_field( $_GET['order'] ) ) : 'desc';
+
+        if ( ! isset( $allowed_orderby[ $orderby ] ) ) {
+            $orderby = 'date';
+        }
+        if ( ! in_array( $order, array( 'asc', 'desc' ), true ) ) {
+            $order = 'desc';
+        }
+
+        $order_by_sql = $allowed_orderby[ $orderby ] . ' ' . strtoupper( $order );
+
+        // ページング
+        $paged    = isset( $_GET['paged'] ) ? max( 1, intval( $_GET['paged'] ) ) : 1;
+        $per_page = 50;
+        $offset   = ( $paged - 1 ) * $per_page;
+
+        $total = (int) $wpdb->get_var(
+            $wpdb->prepare(
+                "SELECT COUNT(*) FROM {$table_name} WHERE blog_id = %d",
+                $blog_id
+            )
+        );
+
+        $rows = $wpdb->get_results(
+            $wpdb->prepare(
+                "SELECT * FROM {$table_name} WHERE blog_id = %d ORDER BY {$order_by_sql} LIMIT %d OFFSET %d",
+                $blog_id,
+                $per_page,
+                $offset
+            )
+        );
+
+        $total_pages = ( $total > 0 ) ? ceil( $total / $per_page ) : 1;
+
+        // ▼ ソートリンク生成用
+        $base_url = remove_query_arg( array( 'paged', 'rvl_export', '_wpnonce' ) );
+
+        $get_sort_url = function( $key ) use ( $orderby, $order, $base_url ) {
+            $next_order = ( $orderby === $key && $order === 'asc' ) ? 'desc' : 'asc';
+            $url = add_query_arg(
+                array(
+                    'orderby' => $key,
+                    'order'   => $next_order,
+                ),
+                $base_url
+            );
+            return esc_url( $url );
+        };
+
+        $export_url = wp_nonce_url(
+            add_query_arg( array( 'rvl_export' => 1 ), $base_url ),
+            'rvl_export'
+        );
+
+        echo '<div class="wrap">';
+        // 管理用アクションバー
+echo '<div style="margin:15px 0;">';
+
+// 全件削除ボタン
+$delete_all_url = wp_nonce_url(
+    add_query_arg( array( 'rvl_delete_all' => 1 ) ),
+    'rvl_delete_all_action'
+);
+echo '<a href="' . esc_url( $delete_all_url ) . '" class="button button-danger" style="background:#dc3232;color:#fff;margin-right:10px;">全件削除</a>';
+
+// 選択した行だけCSV出力
+echo '<button type="submit" name="rvl_export_selected" class="button" style="margin-right:10px;">選択CSVエクスポート</button>';
+
+// Check-Hostリンク
+echo '<a href="https://check-host.net/" target="_blank" class="button button-primary" style="margin-right:10px;">Check-Host.netを開く</a>';
+
+echo '</div>';
+
+        echo '<h1>レビュー閲覧ログ</h1>';
+        echo '<p>このサイト（blog_id = ' . esc_html( $blog_id ) . '）で閲覧された review 投稿のログです。<br>「メモ」欄には「地域」「知り合いかも」など気づいたことを自由に記入できます。</p>';
+
+        echo '<p><a href="' . $export_url . '" class="button">CSVでエクスポート（全件）</a></p>';
+
+        if ( empty( $rows ) ) {
+            echo '<p>まだ閲覧ログはありません。</p>';
+            echo '</div>';
+            return;
+        }
+
+        echo '<form method="post">';
+        wp_nonce_field( 'rvl_bulk_delete' );
+
+        echo '<div class="tablenav top">';
+        echo '<div class="alignleft actions">';
+        echo '<select name="bulk_action">';
+        echo '<option value="">一括操作</option>';
+        echo '<option value="delete">削除</option>';
+        echo '</select> ';
+        echo '<button type="submit" name="rvl_bulk_delete" class="button action">適用</button>';
+        echo '</div>';
+        echo '</div>';
+
+        echo '<table class="widefat fixed striped">';
+        echo '<thead><tr>';
+        echo '<td class="manage-column check-column"><input type="checkbox" id="rvl-check-all"></td>';
+        echo '<th><a href="' . $get_sort_url( 'id' ) . '">ID</a></th>';
+        echo '<th><a href="' . $get_sort_url( 'date' ) . '">日時</a></th>';
+        echo '<th>投稿</th>';
+        echo '<th><a href="' . $get_sort_url( 'ip' ) . '">IPアドレス</a></th>';
+        echo '<th><a href="' . $get_sort_url( 'visit' ) . '">何回目</a></th>';
+        echo '<th>閲覧元URL(リファラ)</th>';
+        echo '<th>メモ</th>';
+        echo '</tr></thead><tbody>';
+
+        foreach ( $rows as $row ) {
+            $post_id    = (int) $row->post_id;
+            $post_title = get_the_title( $post_id );
+            $edit_link  = get_edit_post_link( $post_id );
+            $view_link  = get_permalink( $post_id );
+
+            echo '<tr>';
+            echo '<th class="check-column">';
+            echo '<input type="checkbox" name="log_ids[]" value="' . esc_attr( $row->id ) . '">';
+            echo '</th>';
+
+            echo '<td>' . esc_html( $row->id ) . '</td>';
+            echo '<td>' . esc_html( $row->created_at ) . '</td>';
+
+            echo '<td>';
+            if ( $post_title ) {
+                if ( $edit_link ) {
+                    echo '<a href="' . esc_url( $edit_link ) . '">';
+                    echo esc_html( $post_title ) . ' (ID:' . esc_html( $post_id ) . ')';
+                    echo '</a>';
+                } else {
+                    echo esc_html( $post_title ) . ' (ID:' . esc_html( $post_id ) . ')';
+                }
+                if ( $view_link ) {
+                    echo ' | <a href="' . esc_url( $view_link ) . '" target="_blank" rel="noopener noreferrer">表示</a>';
+                }
+            } else {
+                echo '投稿ID: ' . esc_html( $post_id );
+            }
+            echo '</td>';
+
+            echo '<td>' . esc_html( $row->ip_address ) . '</td>';
+            echo '<td>' . esc_html( $row->visit_number ) . '</td>';
+
+            echo '<td>';
+            if ( ! empty( $row->referrer ) ) {
+                echo '<a href="' . esc_url( $row->referrer ) . '" target="_blank" rel="noopener noreferrer">'
+                    . esc_html( $row->referrer ) . '</a>';
+            } else {
+                echo '(直接アクセス / リファラなし)';
+            }
+            echo '</td>';
+
+            // メモ欄（1行ごとにフォーム）
+            echo '<td>';
+            echo '<form method="post" style="margin:0;">';
+            wp_nonce_field( 'rvl_save_memo_' . $row->id );
+            echo '<input type="hidden" name="log_id" value="' . esc_attr( $row->id ) . '">';
+            echo '<textarea name="memo" rows="2" cols="30" style="width:100%;">' . esc_textarea( $row->memo ) . '</textarea>';
+            echo '<p style="margin-top:4px; text-align:right;"><button type="submit" name="rvl_save_memo" class="button button-small">メモ保存</button></p>';
+            echo '</form>';
+            echo '</td>';
+
+            echo '</tr>';
+        }
+
+        echo '</tbody></table>';
+
+        if ( $total_pages > 1 ) {
+            echo '<div class="tablenav"><div class="tablenav-pages">';
+            for ( $i = 1; $i <= $total_pages; $i++ ) {
+                if ( $i === $paged ) {
+                    echo '<span class="tablenav-page-navspan">' . esc_html( $i ) . '</span> ';
+                } else {
+                    $url = add_query_arg(
+                        array(
+                            'page'  => 'review-view-logs',
+                            'paged' => $i,
+                            'orderby' => $orderby,
+                            'order'   => $order,
+                        ),
+                        $base_url
+                    );
+                    echo '<a class="tablenav-page-navspan" href="' . esc_url( $url ) . '">' . esc_html( $i ) . '</a> ';
+                }
+            }
+            echo '</div></div>';
+        }
+
+        echo '</form>';
+
+        // 全選択 JS
+        echo '<script>
+        document.addEventListener("DOMContentLoaded", function() {
+            var checkAll = document.getElementById("rvl-check-all");
+            if (!checkAll) return;
+            checkAll.addEventListener("change", function() {
+                var checkboxes = document.querySelectorAll(\'input[name="log_ids[]"]\');
+                for (var i = 0; i < checkboxes.length; i++) {
+                    checkboxes[i].checked = checkAll.checked;
+                }
+            });
+        });
+        </script>';
+
+        echo '</div>';
+    }
+
+    /**
+     * CSVエクスポート
+     */
+    private function export_csv( $table_name, $blog_id ) {
+        global $wpdb;
+
+        $rows = $wpdb->get_results(
+            $wpdb->prepare(
+                "SELECT * FROM {$table_name} WHERE blog_id = %d ORDER BY created_at DESC",
+                $blog_id
+            ),
+            ARRAY_A
+        );
+
+        // ヘッダ
+        header( 'Content-Type: text/csv; charset=utf-8' );
+        header( 'Content-Disposition: attachment; filename=review-view-logs-' . date( 'Ymd_His' ) . '.csv' );
+
+        $output = fopen( 'php://output', 'w' );
+
+        // ヘッダ行
+        fputcsv( $output, array( 'id', 'blog_id', 'post_id', 'ip_address', 'user_agent', 'referrer', 'visit_number', 'memo', 'created_at' ) );
+
+        foreach ( $rows as $row ) {
+            fputcsv( $output, $row );
+        }
+
+        fclose( $output );
+        exit;
+    }
+}
+
+new Review_View_Logger();
+
+/**
+ * 指定した review 投稿の閲覧統計を取得する関数
+ */
+function get_review_view_stats( $post_id, $ip = null ) {
+    global $wpdb;
+
+    $post_id = intval( $post_id );
+    if ( ! $post_id ) {
+        return null;
+    }
+
+    $blog_id = get_current_blog_id();
+
+    if ( $ip === null ) {
+        if ( ! empty( $_SERVER['HTTP_X_FORWARDED_FOR'] ) ) {
+            $ips = explode( ',', wp_unslash( $_SERVER['HTTP_X_FORWARDED_FOR'] ) );
+            $ip  = trim( $ips[0] );
+        } elseif ( ! empty( $_SERVER['REMOTE_ADDR'] ) ) {
+            $ip = wp_unslash( $_SERVER['REMOTE_ADDR'] );
+        } else {
+            $ip = '';
+        }
+        $ip = sanitize_text_field( $ip );
+    }
+
+    $table_name = $wpdb->base_prefix . 'view_logs';
+
+    $total_views = (int) $wpdb->get_var(
+        $wpdb->prepare(
+            "SELECT COUNT(*) 
+             FROM {$table_name}
+             WHERE blog_id = %d
+               AND post_id = %d",
+            $blog_id,
+            $post_id
+        )
+    );
+
+    $unique_ip_views = (int) $wpdb->get_var(
+        $wpdb->prepare(
+            "SELECT COUNT(DISTINCT ip_address)
+             FROM {$table_name}
+             WHERE blog_id = %d
+               AND post_id = %d",
+            $blog_id,
+            $post_id
+        )
+    );
+
+    $current_ip_views = 0;
+    if ( $ip ) {
+        $current_ip_views = (int) $wpdb->get_var(
+            $wpdb->prepare(
+                "SELECT MAX(visit_number)
+                 FROM {$table_name}
+                 WHERE blog_id   = %d
+                   AND post_id   = %d
+                   AND ip_address = %s",
+                $blog_id,
+                $post_id,
+                $ip
+            )
+        );
+    }
+
+    $last_viewed_at = $wpdb->get_var(
+        $wpdb->prepare(
+            "SELECT MAX(created_at)
+             FROM {$table_name}
+             WHERE blog_id = %d
+               AND post_id = %d",
+            $blog_id,
+            $post_id
+        )
+    );
+
+    return array(
+        'total_views'      => $total_views,
+        'unique_ip_views'  => $unique_ip_views,
+        'current_ip_views' => $current_ip_views,
+        'last_viewed_at'   => $last_viewed_at ?: null,
+    );
+}

@@ -1,0 +1,25 @@
+# WordPress: バイナリ/自動生成系は追跡しない
+wp-content/cache/
+wp-content/uploads/
+wp-content/upgrade/
+wp-content/backups/
+
+# 環境変数・秘密情報
+.env
+*.key
+*.pem
+
+# ログ・一時ファイル
+*.log
+*.tmp
+
+# OS / エディタ
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# もし使っていれば
+vendor/
+node_modules/
+
